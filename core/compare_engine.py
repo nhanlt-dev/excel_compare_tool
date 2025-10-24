@@ -1,113 +1,147 @@
 import pandas as pd
 import numpy as np
+from decimal import Decimal, InvalidOperation
+import re
+import unicodedata
 
-def _normalize_series(s, case_sensitive: bool):
-    # s is pandas Series (object)
-    s = s.astype(object).fillna("")
-    s = s.map(lambda x: str(x).strip())
+NUMBER_RE = re.compile(r'^[\+\-]?\d+([.,]\d+)?([eE][\+\-]?\d+)?$')
+
+def _strip_accents(text: str) -> str:
+    nfkd = unicodedata.normalize('NFKD', text)
+    return ''.join([c for c in nfkd if not unicodedata.combining(c)])
+
+def normalize_value(v, case_sensitive: bool=False, remove_accents: bool=False):
+    # None/NaN -> ""
+    if v is None:
+        return ""
+    if isinstance(v, float) and np.isnan(v):
+        return ""
+    s = str(v).strip()
+    if s.lower() in ("NotaNumber", "none", ""):
+        return ""
+    # handle thousands / decimal separators
+    s2 = s.replace('\xa0','')
+    if ',' in s2 and '.' in s2:
+        # if '.' after ',', likely decimal dot, remove commas
+        if s2.rfind('.') > s2.rfind(','):
+            s2 = s2.replace(',', '')
+    elif ',' in s2 and '.' not in s2:
+        parts = s2.split(',')
+        if len(parts[-1]) <= 3 and len(parts)==2:
+            s2 = s2.replace(',', '.')
+        else:
+            s2 = s2.replace(',', '')
+    s2 = s2.replace('\u2212','-')
+    s2_clean = s2.strip()
+    if NUMBER_RE.match(s2_clean):
+        try:
+            d = Decimal(s2_clean)
+            if d == d.to_integral():
+                norm = format(d.quantize(1), 'f')
+            else:
+                norm = format(d.normalize(), 'f')
+            return norm
+        except (InvalidOperation, ValueError):
+            pass
+    text = s2_clean
     if not case_sensitive:
-        s = s.str.lower()
-    return s
+        text = text.lower()
+    if remove_accents:
+        text = _strip_accents(text)
+    return text
 
-def compare_tables(file_a, file_b,
-                   key_a, key_b,
-                   pairs,            # list of tuples (colA, colB)
-                   extra_a=None, extra_b=None,
-                   case_sensitive=False,
-                   preview_limit=200,
-                   batch_size=None):
-    """
-    Returns: result_df (DataFrame), preview_df (limited rows for UI)
-    result_df columns: chosen key(s) and extra columns plus Trạng thái, Chi tiết
-    """
-
+def compare_tables(file_a, file_b, key_a, key_b, pairs, extra_a=None, extra_b=None, case_sensitive=False, remove_accents=False, preview_limit=200):
     extra_a = extra_a or []
     extra_b = extra_b or []
     pairs = pairs or []
 
-    # read full tables
-    dfA = pd.read_excel(file_a, dtype=str, engine="openpyxl")
-    dfB = pd.read_excel(file_b, dtype=str, engine="openpyxl")
+    dfA = pd.read_excel(file_a, dtype=object, engine="openpyxl")
+    dfB = pd.read_excel(file_b, dtype=object, engine="openpyxl")
 
-    # Normalize keys
     if key_a not in dfA.columns:
-        raise ValueError(f"Cột khóa '{key_a}' không tồn tại trong File A")
+        raise ValueError(f"Key '{key_a}' not in file A")
     if key_b not in dfB.columns:
-        raise ValueError(f"Cột khóa '{key_b}' không tồn tại trong File B")
+        raise ValueError(f"Key '{key_b}' not in file B")
 
-    dfA["_key"] = _normalize_series(dfA[key_a], case_sensitive)
-    dfB["_key"] = _normalize_series(dfB[key_b], case_sensitive)
+    dfA['_key_norm'] = dfA[key_a].apply(lambda x: normalize_value(x, case_sensitive, remove_accents))
+    dfB['_key_norm'] = dfB[key_b].apply(lambda x: normalize_value(x, case_sensitive, remove_accents))
 
-    # Merge outer to capture all keys
-    merged = pd.merge(dfA, dfB, on="_key", how="outer", suffixes=("_A","_B"), indicator=True)
+    merged = pd.merge(dfA, dfB, on='_key_norm', how='outer', suffixes=('_A','_B'), indicator=True)
 
-    # Compute status:
-    # both => check pairs for differences
-    statuses = []
-    details = []
-    # If no pairs provided, status is based on presence
-    for idx, row in merged.iterrows():
-        ind = row["_merge"]
-        if ind == "left_only":
-            statuses.append("Chỉ bên A")
-            details.append("")
-        elif ind == "right_only":
-            statuses.append("Chỉ bên B")
-            details.append("")
-        else:  # both
-            diffs = []
-            for a_col, b_col in pairs:
-                # resolve names after merge
-                colA = a_col if a_col in merged.columns else (a_col + "_A" if a_col + "_A" in merged.columns else None)
-                colB = b_col if b_col in merged.columns else (b_col + "_B" if b_col + "_B" in merged.columns else None)
-                valA = "" if colA is None else ("" if pd.isna(row[colA]) else str(row[colA]).strip())
-                valB = "" if colB is None else ("" if pd.isna(row[colB]) else str(row[colB]).strip())
-                compA = valA if case_sensitive else valA.lower()
-                compB = valB if case_sensitive else valB.lower()
-                if compA != compB:
-                    diffs.append(f"{a_col}≠{b_col}: '{valB}'→'{valA}'")
-            if diffs:
-                statuses.append("Khác")
-                details.append("; ".join(diffs))
+    status = []
+    detail = []
+
+    # precompute normalized series for all columns we will compare
+    norm_cache = {}
+    def norm_series(side, col):
+        k = (side,col)
+        if k in norm_cache:
+            return norm_cache[k]
+        if side == 'A':
+            if col in merged.columns:
+                s = merged[col]
+            elif col + '_A' in merged.columns:
+                s = merged[col + '_A']
             else:
-                statuses.append("Khớp")
-                details.append("")
-    merged["Trạng thái"] = statuses
-    merged["Chi tiết"] = details
+                s = pd.Series([""]*len(merged), index=merged.index)
+        else:
+            if col in merged.columns:
+                s = merged[col]
+            elif col + '_B' in merged.columns:
+                s = merged[col + '_B']
+            else:
+                s = pd.Series([""]*len(merged), index=merged.index)
+        normed = s.map(lambda x: normalize_value(x, case_sensitive, remove_accents))
+        norm_cache[k] = normed
+        return normed
 
-    # Build output column list: include readable keys and extras
+    for i, r in merged.iterrows():
+        ind = r['_merge']
+        if ind == 'left_only':
+            status.append("Chỉ bên A"); detail.append("")
+            continue
+        if ind == 'right_only':
+            status.append("Chỉ bên B"); detail.append("")
+            continue
+        diffs = []
+        for a_col, b_col in pairs:
+            na = norm_series('A', a_col).iat[i]
+            nb = norm_series('B', b_col).iat[i]
+            if na != nb:
+                rawA = r[a_col] if a_col in merged.columns else r.get(a_col+'_A','')
+                rawB = r[b_col] if b_col in merged.columns else r.get(b_col+'_B','')
+                diffs.append(f"{a_col}≠{b_col}: '{rawB}'→'{rawA}'")
+        if diffs:
+            status.append("Khác"); detail.append("; ".join(diffs))
+        else:
+            status.append("Khớp"); detail.append("")
+    merged['Trạng thái'] = status
+    merged['Chi tiết'] = detail
+
+    # Build output columns: keyA/keyB readable then extras then status/detail
     out_cols = []
-    # try original key columns (prefer A then B)
     if key_a in merged.columns:
         out_cols.append(key_a)
-    elif key_a + "_A" in merged.columns:
-        out_cols.append(key_a + "_A")
-    if key_b in merged.columns and (key_b not in out_cols):
+    elif key_a + '_A' in merged.columns:
+        out_cols.append(key_a + '_A')
+    if key_b in merged.columns and key_b not in out_cols:
         out_cols.append(key_b)
-    elif key_b + "_B" in merged.columns and (key_b + "_B" not in out_cols):
-        out_cols.append(key_b + "_B")
+    elif key_b + '_B' in merged.columns and (key_b + '_B') not in out_cols:
+        out_cols.append(key_b + '_B')
 
-    # extras
     for c in extra_a:
         if c in merged.columns:
             out_cols.append(c)
-        elif c + "_A" in merged.columns:
-            out_cols.append(c + "_A")
+        elif c + '_A' in merged.columns:
+            out_cols.append(c + '_A')
     for c in extra_b:
         if c in merged.columns:
             out_cols.append(c)
-        elif c + "_B" in merged.columns:
-            out_cols.append(c + "_B")
+        elif c + '_B' in merged.columns:
+            out_cols.append(c + '_B')
 
-    # Finally status fields
-    out_cols += ["Trạng thái", "Chi tiết"]
-
-    # Filter existing
+    out_cols += ['Trạng thái', 'Chi tiết']
     out_cols = [c for c in out_cols if c in merged.columns]
-
     result_df = merged.loc[:, out_cols].copy()
-
-    # preview
     preview_df = result_df.head(preview_limit).copy()
-
     return result_df, preview_df
