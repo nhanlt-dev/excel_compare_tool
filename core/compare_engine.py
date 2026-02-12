@@ -58,6 +58,8 @@ def compare_tables(file_a, file_b, key_a, key_b, pairs, extra_a=None, extra_b=No
     dfA = pd.read_excel(file_a, dtype=object, engine="openpyxl")
     dfB = pd.read_excel(file_b, dtype=object, engine="openpyxl")
 
+    dfA['_orderA'] = range(len(dfA))
+
     if key_a not in dfA.columns:
         raise ValueError(f"Key '{key_a}' not in file A")
     if key_b not in dfB.columns:
@@ -66,7 +68,7 @@ def compare_tables(file_a, file_b, key_a, key_b, pairs, extra_a=None, extra_b=No
     dfA['_key_norm'] = dfA[key_a].apply(lambda x: normalize_value(x, case_sensitive, remove_accents))
     dfB['_key_norm'] = dfB[key_b].apply(lambda x: normalize_value(x, case_sensitive, remove_accents))
 
-    merged = pd.merge(dfA, dfB, on='_key_norm', how='outer', suffixes=('_A','_B'), indicator=True)
+    merged = pd.merge(dfA, dfB, on='_key_norm', how='left', suffixes=('_A','_B'), indicator=True)
 
     status = []
     detail = []
