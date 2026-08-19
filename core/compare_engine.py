@@ -3,6 +3,9 @@ import numpy as np
 from decimal import Decimal, InvalidOperation
 import re
 import unicodedata
+from utils.logger import get_logger
+
+logger = get_logger()
 
 NUMBER_RE = re.compile(r'^[\+\-]?\d+([.,]\d+)?([eE][\+\-]?\d+)?$')
 
@@ -50,13 +53,16 @@ def normalize_value(v, case_sensitive: bool=False, remove_accents: bool=False):
         text = _strip_accents(text)
     return text
 
-def compare_tables(file_a, file_b, key_a, key_b, pairs, extra_a=None, extra_b=None, case_sensitive=False, remove_accents=False, preview_limit=200):
+def compare_tables(file_a, file_b, key_a, key_b, pairs, extra_a=None, extra_b=None, case_sensitive=False, remove_accents=False, preview_limit=200, sheet_a=0, sheet_b=0, header_row_a=1, header_row_b=1):
+    """Compare two Excel files and return result DataFrame with status and details."""
+    logger.info(f"Starting comparison: {file_a} vs {file_b}")
+    logger.info(f"Keys: A='{key_a}' B='{key_b}', pairs={len(pairs)}, case_sensitive={case_sensitive}, remove_accents={remove_accents}")
     extra_a = extra_a or []
     extra_b = extra_b or []
     pairs = pairs or []
 
-    dfA = pd.read_excel(file_a, dtype=object, engine="openpyxl")
-    dfB = pd.read_excel(file_b, dtype=object, engine="openpyxl")
+    dfA = pd.read_excel(file_a, sheet_name=sheet_a, header=header_row_a - 1, dtype=object, engine="openpyxl")
+    dfB = pd.read_excel(file_b, sheet_name=sheet_b, header=header_row_b - 1, dtype=object, engine="openpyxl")
 
     dfA['_orderA'] = range(len(dfA))
 
@@ -120,30 +126,35 @@ def compare_tables(file_a, file_b, key_a, key_b, pairs, extra_a=None, extra_b=No
     merged['Trạng thái'] = status
     merged['Chi tiết'] = detail
 
-    # Build output columns: keyA/keyB readable then extras then status/detail
-    out_cols = []
-    if key_a in merged.columns:
-        out_cols.append(key_a)
-    elif key_a + '_A' in merged.columns:
-        out_cols.append(key_a + '_A')
-    if key_b in merged.columns and key_b not in out_cols:
-        out_cols.append(key_b)
-    elif key_b + '_B' in merged.columns and (key_b + '_B') not in out_cols:
-        out_cols.append(key_b + '_B')
+    # Output in readable blocks: all A fields, then all B fields, then result.
+    # Within each block, preserve the original worksheet column order.
+    internal = {'_orderA', '_key_norm'}
+    original_a = [c for c in dfA.columns if c not in internal]
+    original_b = [c for c in dfB.columns if c not in internal]
+    wanted_a = set(extra_a) | {key_a}
+    wanted_b = set(extra_b) | {key_b}
+    ordered_a = [c for c in original_a if c in wanted_a]
+    ordered_b = [c for c in original_b if c in wanted_b]
+    overlap = set(original_a) & set(original_b)
 
-    for c in extra_a:
-        if c in merged.columns:
-            out_cols.append(c)
-        elif c + '_A' in merged.columns:
-            out_cols.append(c + '_A')
-    for c in extra_b:
-        if c in merged.columns:
-            out_cols.append(c)
-        elif c + '_B' in merged.columns:
-            out_cols.append(c + '_B')
-
-    out_cols += ['Trạng thái', 'Chi tiết']
-    out_cols = [c for c in out_cols if c in merged.columns]
-    result_df = merged.loc[:, out_cols].copy()
+    output_series = []
+    output_names = []
+    for side, columns in (('A', ordered_a), ('B', ordered_b)):
+        for column in columns:
+            merged_column = column + f'_{side}' if column in overlap else column
+            if merged_column not in merged.columns:
+                continue
+            display_name = f"{column} [{side}]" if column in overlap else column
+            output_series.append(merged[merged_column])
+            output_names.append(display_name)
+    output_series += [merged['Trạng thái'], merged['Chi tiết']]
+    output_names += ['Trạng thái', 'Chi tiết']
+    result_df = pd.concat(output_series, axis=1)
+    result_df.columns = output_names
     preview_df = result_df.head(preview_limit).copy()
+
+    # Log summary statistics
+    status_counts = result_df['Trạng thái'].value_counts().to_dict()
+    logger.info(f"Comparison completed: total={len(result_df)}, status_counts={status_counts}")
+
     return result_df, preview_df

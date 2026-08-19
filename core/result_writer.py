@@ -2,8 +2,12 @@ import pandas as pd
 import os
 from datetime import datetime
 from tkinter import filedialog, messagebox
+from utils.logger import get_logger
+
+logger = get_logger()
 
 def save_result_dialog(df, parent=None):
+    logger.info(f"Exporting result: {len(df)} rows")
     default = f"compare_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
     path = filedialog.asksaveasfilename(parent=parent, defaultextension=".xlsx", filetypes=[("Excel files","*.xlsx")], initialfile=default, title="Chọn nơi lưu kết quả")
     if not path:
@@ -31,12 +35,19 @@ def save_result_dialog(df, parent=None):
                 summary.columns = ['Trạng thái','Số lượng']
                 summary.to_excel(writer, sheet_name='Summary', index=False)
             except Exception:
+                logger.warning("Failed to create summary sheet", exc_info=True)
                 pass
-        return os.path.abspath(path)
+        abs_path = os.path.abspath(path)
+        logger.info(f"Result saved successfully: {abs_path}")
+        return abs_path
     except Exception as e:
+        logger.error(f"Failed to save Excel with xlsxwriter: {e}", exc_info=True)
         try:
             df.to_excel(path, index=False)
-            return os.path.abspath(path)
+            abs_path = os.path.abspath(path)
+            logger.info(f"Result saved with basic method: {abs_path}")
+            return abs_path
         except Exception as e2:
+            logger.error(f"Both export methods failed. Second error: {e2}", exc_info=True)
             messagebox.showerror("Lỗi lưu file", f"{e}\n{e2}", parent=parent)
             return None
